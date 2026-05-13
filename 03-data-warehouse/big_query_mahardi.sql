@@ -230,7 +230,7 @@ WHERE DATE(tpep_pickup_datetime) BETWEEN '2019-06-01' AND '2020-12-31'
 --   - yellow_tripdata_partitioned_clustered (CP3 demo, optional to keep)
 --
 -- Cleanup approach (BQ scripting):
-/*
+
 FOR row IN
 (
   SELECT table_name
@@ -243,7 +243,7 @@ DO
     row.table_name
   );
 END FOR;
-*/
+
 
 
 -- =============================================
@@ -284,7 +284,7 @@ END FOR;
 -- PRODUCTION-GRADE VERSION (for reference)
 -- =============================================
 -- If rebuilding for production, define schema explicitly (matches Module 2):
-/*
+
 CREATE OR REPLACE EXTERNAL TABLE `dezoomcamp170426.zoomcamp.external_yellow_tripdata`
 (
   VendorID STRING,
@@ -315,4 +315,103 @@ OPTIONS (
   skip_leading_rows = 1,
   ignore_unknown_values = TRUE
 );
-*/
+
+
+-- =============================================
+-- CP4: BQML — Create feature table
+-- =============================================
+-- Source: yellow_tripdata (Module 2, partitioned, VendorID=STRING)
+-- Target: tip_amount
+-- Features: passenger_count, trip_distance, PULocationID, DOLocationID,
+--           payment_type, fare_amount, tolls_amount
+
+CREATE OR REPLACE TABLE `dezoomcamp170426.zoomcamp.yellow_tripdata_ml` (
+  `passenger_count` INTEGER,
+  `trip_distance` FLOAT64,
+  `PULocationID` STRING,
+  `DOLocationID` STRING,
+  `payment_type` STRING,
+  `fare_amount` FLOAT64,
+  `tolls_amount` FLOAT64,
+  `tip_amount` FLOAT64
+) AS (
+  SELECT
+    CAST(passenger_count AS INTEGER),
+    CAST(trip_distance AS FLOAT64),
+    PULocationID,                          -- sudah STRING dari Module 2
+    DOLocationID,                          -- sudah STRING dari Module 2
+    CAST(payment_type AS STRING),          -- satu-satunya yang perlu CAST
+    CAST(fare_amount AS FLOAT64),
+    CAST(tolls_amount AS FLOAT64),
+    CAST(tip_amount AS FLOAT64)
+  FROM `dezoomcamp170426.zoomcamp.yellow_tripdata`
+  WHERE fare_amount != 0
+);
+
+-- =============================================
+-- CP4: BQML — Train linear regression model
+-- =============================================
+CREATE OR REPLACE MODEL `dezoomcamp170426.zoomcamp.tip_model`
+OPTIONS (
+  model_type = 'linear_reg',
+  input_label_cols = ['tip_amount'],
+  DATA_SPLIT_METHOD = 'AUTO_SPLIT'
+) AS
+SELECT * FROM `dezoomcamp170426.zoomcamp.yellow_tripdata_ml`
+WHERE tip_amount IS NOT NULL;
+
+-- 3a: Feature info — verify category vs numeric detection
+SELECT * FROM ML.FEATURE_INFO(MODEL `dezoomcamp170426.zoomcamp.tip_model`);
+
+-- 3b: Evaluate model performance
+SELECT * FROM ML.EVALUATE(
+  MODEL `dezoomcamp170426.zoomcamp.tip_model`,
+  (SELECT * FROM `dezoomcamp170426.zoomcamp.yellow_tripdata_ml`
+   WHERE tip_amount IS NOT NULL)
+);
+
+-- 3c: Predict tip amount
+SELECT * FROM ML.PREDICT(
+  MODEL `dezoomcamp170426.zoomcamp.tip_model`,
+  (SELECT * FROM `dezoomcamp170426.zoomcamp.yellow_tripdata_ml`
+   WHERE tip_amount IS NOT NULL)
+) LIMIT 10;
+
+-- 3d: Explain top features per prediction
+SELECT * FROM ML.EXPLAIN_PREDICT(
+  MODEL `dezoomcamp170426.zoomcamp.tip_model`,
+  (SELECT * FROM `dezoomcamp170426.zoomcamp.yellow_tripdata_ml`
+   WHERE tip_amount IS NOT NULL),
+  STRUCT(3 AS top_k_features)
+) LIMIT 10;
+
+-- =============================================
+-- CP4: BQML — Full Lifecycle — COMPLETED
+-- =============================================
+-- Feature table: yellow_tripdata_ml (109,001,955 rows, 5.33 GB logical)
+-- Bytes to create: 9.08 GB scanned from yellow_tripdata
+-- Model: tip_model (linear_reg, AUTO_SPLIT), trained in 1 min 5 sec
+--
+-- ML.FEATURE_INFO confirms:
+--   PULocationID (263 categories), DOLocationID (264), payment_type = CATEGORICAL ✅
+--   passenger_count, trip_distance, fare_amount, tolls_amount = NUMERIC ✅
+--
+-- DATA QUALITY ISSUES found via FEATURE_INFO:
+--   trip_distance: min=-37,264 max=350,914 (impossible values)
+--   fare_amount:   min=-$1,856 max=$998,310 (impossible values)
+--   passenger_count: 1,055,878 nulls (~1% data)
+--   → Garbage in = garbage out. Data cleaning > model tuning.
+--
+-- ML.EVALUATE:
+--   MAE: $1.04 (avg prediction off by $1)
+--   R²:  0.214 (model explains only 21% of tip variance — POOR)
+--   Instructor expected: ~same. Model intentionally simple for demo.
+--
+-- ML.PREDICT insight:
+--   payment_type=2 (Cash): actual tip=$0 because cash tips NOT recorded in meter
+--   Model doesn't know this → predicts $6+ for cash trips = systematic error
+--   Domain knowledge (understanding business context) catches what pure ML misses
+--
+-- Key learning: BQML is SQL-accessible ML — no Python, no export.
+--   Good for: quick prototyping, analyst-friendly models, in-warehouse prediction
+--   Not for: production-grade ML (data cleaning, feature engineering, monitoring needed)
