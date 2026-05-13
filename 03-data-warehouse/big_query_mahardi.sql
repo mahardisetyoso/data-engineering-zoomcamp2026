@@ -415,3 +415,98 @@ SELECT * FROM ML.EXPLAIN_PREDICT(
 -- Key learning: BQML is SQL-accessible ML — no Python, no export.
 --   Good for: quick prototyping, analyst-friendly models, in-warehouse prediction
 --   Not for: production-grade ML (data cleaning, feature engineering, monitoring needed)
+
+-- =============================================
+-- CP7: Homework — FHV 2019 — COMPLETED
+-- =============================================
+-- Dataset: For-Hire Vehicle (FHV) trip data 2019
+-- Source: https://github.com/DataTalksClub/nyc-tlc-data/releases/tag/fhv
+-- 12 monthly CSV files uploaded to gs://mahardi-dezoomcamp-kestra/
+
+-- Setup: External table
+CREATE OR REPLACE EXTERNAL TABLE `dezoomcamp170426.zoomcamp.external_fhv_tripdata`
+OPTIONS (
+  format = 'CSV',
+  uris = ['gs://mahardi-dezoomcamp-kestra/fhv_tripdata_2019-*.csv'],
+  skip_leading_rows = 1
+);
+
+-- Setup: Native non-partitioned (baseline)
+CREATE OR REPLACE TABLE `dezoomcamp170426.zoomcamp.fhv_tripdata_non_partitioned` AS
+SELECT * FROM `dezoomcamp170426.zoomcamp.external_fhv_tripdata`;
+
+-- Q1: Count FHV 2019 records
+SELECT COUNT(*) FROM `dezoomcamp170426.zoomcamp.fhv_tripdata_non_partitioned`;
+-- Answer: 43,244,696
+
+-- Q2: Count distinct Affiliated_base_number — external vs native
+SELECT COUNT(DISTINCT Affiliated_base_number)
+FROM `dezoomcamp170426.zoomcamp.external_fhv_tripdata`;
+-- Bytes processed: ~2.52 GB (full CSV scan in GCS)
+
+SELECT COUNT(DISTINCT Affiliated_base_number)
+FROM `dezoomcamp170426.zoomcamp.fhv_tripdata_non_partitioned`;
+-- Bytes processed: ~317.94 MB (Capacitor columnar, single column scan)
+--
+-- Insight: same query, same data, 8x cost difference
+--   External scans raw CSV (all columns parsed) in GCS
+--   Native scans only Affiliated_base_number column in Colossus
+
+-- Q3: Records with BOTH blank PUlocationID AND DOlocationID
+SELECT COUNT(*)
+FROM `dezoomcamp170426.zoomcamp.fhv_tripdata_non_partitioned`
+WHERE PUlocationID IS NULL AND DOlocationID IS NULL;
+-- Answer: 717,748
+-- Bytes processed: ~638.9 MB
+
+-- Q4: Best strategy for filter by pickup_datetime + order by affiliated_base_number?
+-- Answer: Partition by DATE(pickup_datetime), Cluster by Affiliated_base_number
+--   Rationale:
+--     - Filter col → partition col (enables partition pruning)
+--     - Order col → cluster col (data pre-sorted within partition, faster ORDER BY)
+
+-- Q5: Implement optimized table + benchmark March 2019
+CREATE OR REPLACE TABLE `dezoomcamp170426.zoomcamp.fhv_tripdata_partitioned_clustered`
+PARTITION BY DATE(pickup_datetime)
+CLUSTER BY Affiliated_base_number AS
+SELECT * FROM `dezoomcamp170426.zoomcamp.external_fhv_tripdata`;
+-- Table creation: 2.52 GB processed, 32 sec
+
+-- Benchmark: Non-partitioned
+SELECT DISTINCT Affiliated_base_number
+FROM `dezoomcamp170426.zoomcamp.fhv_tripdata_non_partitioned`
+WHERE DATE(pickup_datetime) BETWEEN '2019-03-01' AND '2019-03-31';
+-- Bytes processed: ~647.87 MB
+
+-- Benchmark: Partitioned + clustered
+SELECT DISTINCT Affiliated_base_number
+FROM `dezoomcamp170426.zoomcamp.fhv_tripdata_partitioned_clustered`
+WHERE DATE(pickup_datetime) BETWEEN '2019-03-01' AND '2019-03-31';
+-- Bytes processed: ~23.05 MB
+--
+-- Result: 647.87 / 23.05 = 28.1x reduction
+-- Even better than yellow taxi CP2 (21x) — FHV data has favorable
+-- distribution for partition pruning (March = 1/12 year, clean boundaries)
+
+-- Q6: Where is external table data stored?
+-- Answer: GCS (Google Cloud Storage)
+-- NOT Colossus. External = pointer to files outside BQ. Native = Colossus.
+
+-- Q7: "It is best practice to always cluster your data" — True or False?
+-- Answer: FALSE
+--   - Tables < 1 GB: cluster overhead > benefit
+--   - Filter pattern must match cluster column for any benefit
+--   - Cluster benefit depends on selectivity (learned in CP3: VendorID=4 only 11% reduction)
+--   - Decision: analyze query patterns + data distribution BEFORE clustering
+
+
+-- =============================================
+-- HOMEWORK ANSWER SUMMARY
+-- =============================================
+-- Q1: 43,244,696
+-- Q2: External ~2.52 GB, Native ~317.94 MB
+-- Q3: 717,748
+-- Q4: Partition by DATE(pickup_datetime), Cluster by Affiliated_base_number
+-- Q5: Non-partitioned ~647.87 MB, Optimized ~23.05 MB
+-- Q6: GCS (Google Cloud Storage)
+-- Q7: False
