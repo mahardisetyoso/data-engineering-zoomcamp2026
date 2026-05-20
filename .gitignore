@@ -46,3 +46,4 @@ logs/
 
 # Kestra specific
 .kestra/
+.dbt-keys/
